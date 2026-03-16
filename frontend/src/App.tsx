@@ -1,24 +1,71 @@
-import "./App.css";
-import "@xyflow/react/dist/style.css";
 import {
-  addEdge,
-  applyEdgeChanges,
-  applyNodeChanges,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+} from "react";
+import {
+  ReactFlow,
   Background,
   Controls,
-  MiniMap,
-  ReactFlow,
   useReactFlow,
-  type Connection,
+  applyNodeChanges,
   type Edge,
-  type EdgeChange,
   type Node,
   type NodeChange,
+  type Connection,
+  type NodeMouseHandler,
+  type EdgeMouseHandler,
 } from "@xyflow/react";
-import { useCallback, useEffect, useState, type MouseEvent } from "react";
-import { getNewNodeData } from "./utils/get-new-node-data";
+import "@xyflow/react/dist/style.css";
+import "./App.css";
+
+import * as Y from "yjs";
+
 import { useHocuspocusProvider } from "./hooks/use-hocuspocus-provider";
-// import { HocuspocusProvider } from "@hocuspocus/provider";
+
+import { getGraphYDoc, readGraphState } from "./collab/yjs-graph-doc";
+import {
+  mapGraphLinksToReactFlowEdges,
+  mapGraphNodesToReactFlowNodes,
+} from "./collab/reactflow-mappers";
+import { runGraphAction } from "./collab/graph-action-runner";
+
+import { buildPerformanceReadModel } from "./analytics/readModels";
+
+import {
+  DEFAULT_GRAPH_ID,
+  GOVERNANCE_AUTHORITATIVE,
+  GOVERNANCE_COMMUNITY,
+} from "./domain/constants";
+
+import {
+  getLinkCanonicalStatus,
+  getNodeCanonicalStatus,
+  resolveNodeStance,
+} from "./domain/selectors";
+
+import type { ExecuteCommandResult } from "./app/graphCommandService";
+
+import type {
+  GraphLinkEntity,
+  GraphNodeEntity,
+  GraphNodeLayout,
+  PerformanceReadModel,
+  ReviewSession,
+  ScoreLedgerEntry,
+  UserId,
+  UserSessionEvaluation,
+  UserTrustProfile,
+} from "./domain/types";
+
+import { GraphNode } from "./ui/GraphNode";
+import { GraphEdge } from "./ui/GraphEdge";
+import { PerformanceStatsPanel } from "./ui/PerformanceStatsPanel";
+import { ReviewSessionsPanel } from "./ui/ReviewSessionsPanel";
+import { SessionReviewToolbar } from "./ui/SessionReviewToolbar";
 
 type CursorPosition = { x: number; y: number };
 
@@ -27,235 +74,812 @@ type AwarenessUserData = {
   cursorPosition: CursorPosition;
 };
 
-const Cursor = ({ cursorPosition, userName }: AwarenessUserData) => {
-  return (
-    <div
-      className="cursor"
-      style={{ top: cursorPosition.y, left: cursorPosition.x }}
-    >
-      <div className="pointer"></div>
-      <div className="name-badge">{userName}</div>
-    </div>
-  );
+type EventLogItem = {
+  ts: string;
+  message: string;
 };
 
-// const provider = new HocuspocusProvider({
-//   url: "ws://127.0.0.1:5000",
-//   name: "reactflow-yjs",
-// });
+const nodeTypes = {
+  graphNode: GraphNode,
+};
 
-// const ydoc = provider.document;
-// // live data structures; instantly propagate changes to other clients
-// const nodesMap = ydoc.getMap<Node>("nodes");
-// const edgesMap = ydoc.getMap<Edge>("edges");
+const edgeTypes = {
+  graphEdge: GraphEdge,
+};
 
-export const App = () => {
-  const [nodes, setNodes] = useState<Node[]>([]);
-  const [edges, setEdges] = useState<Edge[]>([]);
-  const { provider, nodesMap, edgesMap, userName } = useHocuspocusProvider();
-  const [awareness, setAwareness] = useState<AwarenessUserData[]>([]);
-  const { screenToFlowPosition, flowToScreenPosition } = useReactFlow();
+function resolveCurrentUser(userName: string): UserId {
+  const normalized = userName.trim().toLowerCase();
 
-  //observer maps for changes
-  useEffect(() => {
-    if (!nodesMap || !edgesMap) {
-      return;
+  if (normalized === "o" || normalized === "owner") return "O";
+  if (normalized === "g_1" || normalized === "g1" || normalized === "guest1")
+    return "G_1";
+  if (normalized === "g_2" || normalized === "g2" || normalized === "guest2")
+    return "G_2";
+  if (normalized === "g_3" || normalized === "g3" || normalized === "guest3")
+    return "G_3";
+
+  return "G_1";
+}
+
+function seedGraphIfEmpty(ydoc: Y.Doc): boolean {
+  const graphDoc = getGraphYDoc(ydoc);
+
+  if (graphDoc.nodesMap.size > 0) {
+    return false;
+  }
+
+  const now = new Date().toISOString();
+
+  const initialNodes: GraphNodeEntity[] = [
+    {
+      id: "n-owner",
+      label: "Owner concept",
+      creatorId: "O",
+      governanceMode: GOVERNANCE_AUTHORITATIVE,
+      votesByUser: {},
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "n-guest-1",
+      label: "Guest 1 concept",
+      creatorId: "G_1",
+      governanceMode: GOVERNANCE_COMMUNITY,
+      votesByUser: {},
+      createdAt: now,
+      updatedAt: now,
+    },
+    {
+      id: "n-guest-2",
+      label: "Guest 2 concept",
+      creatorId: "G_2",
+      governanceMode: GOVERNANCE_COMMUNITY,
+      votesByUser: {},
+      createdAt: now,
+      updatedAt: now,
+    },
+  ];
+
+  graphDoc.ydoc.transact(() => {
+    graphDoc.metaMap.set("graphId", DEFAULT_GRAPH_ID);
+    graphDoc.metaMap.set("revision", 0);
+
+    for (const node of initialNodes) {
+      graphDoc.nodesMap.set(node.id, node);
     }
 
-    // define the callbacks that update the local state when shared state changes
-    const nodesObserver = () => {
-      setNodes(Array.from(nodesMap.values()));
-    };
-    const edgesObserver = () => {
-      setEdges(Array.from(edgesMap.values()));
-    };
-    // call the observers once when the component mounts to sync initial state
-    nodesObserver();
-    edgesObserver();
+    graphDoc.layoutMap.set("n-owner", {
+      nodeId: "n-owner",
+      x: 160,
+      y: 140,
+    });
 
-    // observers are triggered on changes
-    nodesMap.observe(nodesObserver);
-    edgesMap.observe(edgesObserver);
+    graphDoc.layoutMap.set("n-guest-1", {
+      nodeId: "n-guest-1",
+      x: 500,
+      y: 140,
+    });
+
+    graphDoc.layoutMap.set("n-guest-2", {
+      nodeId: "n-guest-2",
+      x: 330,
+      y: 360,
+    });
+  });
+
+  return true;
+}
+
+function Cursor({ cursorPosition, userName }: AwarenessUserData) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        left: cursorPosition.x,
+        top: cursorPosition.y,
+        pointerEvents: "none",
+        zIndex: 9999,
+      }}
+    >
+      <div
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: "50%",
+          background: "#ef4444",
+        }}
+      />
+      <div
+        style={{
+          marginTop: 4,
+          background: "#111827",
+          color: "#ffffff",
+          fontSize: 11,
+          padding: "2px 6px",
+          borderRadius: 4,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {userName}
+      </div>
+    </div>
+  );
+}
+
+function InspectorPanel({
+  selectedNode,
+  selectedLink,
+  currentUser,
+}: {
+  selectedNode: GraphNodeEntity | null;
+  selectedLink: GraphLinkEntity | null;
+  currentUser: UserId;
+}) {
+  if (!selectedNode && !selectedLink) {
+    return (
+      <div
+        style={{
+          position: "fixed",
+          left: 16,
+          top: 16,
+          width: 340,
+          maxHeight: 260,
+          overflow: "auto",
+          background: "#ffffff",
+          border: "1px solid #d1d5db",
+          borderRadius: 12,
+          padding: 12,
+          boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+          fontSize: 12,
+          zIndex: 20,
+        }}
+      >
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Inspector</div>
+        <div style={{ color: "#6b7280" }}>No entity selected</div>
+        <div style={{ marginTop: 10, color: "#6b7280" }}>
+          Current user: {currentUser}
+        </div>
+      </div>
+    );
+  }
+
+  if (selectedNode) {
+    const stance = resolveNodeStance(selectedNode, currentUser);
+    const canonicalStatus = getNodeCanonicalStatus(selectedNode);
+
+    return (
+      <div
+        style={{
+          position: "fixed",
+          left: 16,
+          top: 16,
+          width: 340,
+          maxHeight: 320,
+          overflow: "auto",
+          background: "#ffffff",
+          border: "1px solid #d1d5db",
+          borderRadius: 12,
+          padding: 12,
+          boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+          fontSize: 12,
+          zIndex: 20,
+        }}
+      >
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Node inspector</div>
+
+        <div>
+          <strong>id:</strong> {selectedNode.id}
+        </div>
+        <div>
+          <strong>label:</strong> {selectedNode.label}
+        </div>
+        <div>
+          <strong>creatorId:</strong> {selectedNode.creatorId}
+        </div>
+        <div>
+          <strong>governanceMode:</strong> {selectedNode.governanceMode}
+        </div>
+        <div>
+          <strong>canonical status:</strong> {canonicalStatus}
+        </div>
+        <div>
+          <strong>your stance:</strong> {stance}
+        </div>
+        <div>
+          <strong>createdAt:</strong> {selectedNode.createdAt}
+        </div>
+        <div>
+          <strong>updatedAt:</strong> {selectedNode.updatedAt}
+        </div>
+
+        <div style={{ marginTop: 10, fontWeight: 700 }}>votesByUser</div>
+        <pre
+          style={{
+            marginTop: 6,
+            padding: 8,
+            background: "#f9fafb",
+            border: "1px solid #e5e7eb",
+            borderRadius: 6,
+            overflowX: "auto",
+            fontSize: 11,
+            lineHeight: 1.4,
+          }}
+        >
+          {JSON.stringify(selectedNode.votesByUser, null, 2)}
+        </pre>
+      </div>
+    );
+  }
+
+  const link = selectedLink!;
+  const canonicalStatus = getLinkCanonicalStatus(link);
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        left: 16,
+        top: 16,
+        width: 340,
+        maxHeight: 320,
+        overflow: "auto",
+        background: "#ffffff",
+        border: "1px solid #d1d5db",
+        borderRadius: 12,
+        padding: 12,
+        boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+        fontSize: 12,
+        zIndex: 20,
+      }}
+    >
+      <div style={{ fontWeight: 700, marginBottom: 8 }}>Link inspector</div>
+
+      <div>
+        <strong>id:</strong> {link.id}
+      </div>
+      <div>
+        <strong>label:</strong> {link.label || "relation"}
+      </div>
+      <div>
+        <strong>sourceId:</strong> {link.sourceId}
+      </div>
+      <div>
+        <strong>targetId:</strong> {link.targetId}
+      </div>
+      <div>
+        <strong>creatorId:</strong> {link.creatorId}
+      </div>
+      <div>
+        <strong>supportType:</strong> {link.supportType}
+      </div>
+      <div>
+        <strong>governanceMode:</strong> {link.governanceMode}
+      </div>
+      <div>
+        <strong>globalVoteLocked:</strong> {String(link.globalVoteLocked)}
+      </div>
+      <div>
+        <strong>canonical status:</strong> {canonicalStatus}
+      </div>
+      <div>
+        <strong>createdAt:</strong> {link.createdAt}
+      </div>
+      <div>
+        <strong>updatedAt:</strong> {link.updatedAt}
+      </div>
+
+      <div style={{ marginTop: 10, fontWeight: 700 }}>votesByUser</div>
+      <pre
+        style={{
+          marginTop: 6,
+          padding: 8,
+          background: "#f9fafb",
+          border: "1px solid #e5e7eb",
+          borderRadius: 6,
+          overflowX: "auto",
+          fontSize: 11,
+          lineHeight: 1.4,
+        }}
+      >
+        {JSON.stringify(link.votesByUser, null, 2)}
+      </pre>
+
+      <div style={{ marginTop: 10, fontWeight: 700 }}>voteLocksByUser</div>
+      <pre
+        style={{
+          marginTop: 6,
+          padding: 8,
+          background: "#f9fafb",
+          border: "1px solid #e5e7eb",
+          borderRadius: 6,
+          overflowX: "auto",
+          fontSize: 11,
+          lineHeight: 1.4,
+        }}
+      >
+        {JSON.stringify(link.voteLocksByUser, null, 2)}
+      </pre>
+    </div>
+  );
+}
+
+function emptyPerformance(graphId: string): PerformanceReadModel {
+  return {
+    graphId,
+    currentSessionId: undefined,
+    quickStats: [],
+    latestEvaluations: [],
+    recentLedgerEntries: [],
+    trustProfiles: [],
+    allEvaluations: [],
+    reviewSessions: [],
+    sessionHistory: [],
+    overallStats: {} as PerformanceReadModel["overallStats"],
+  };
+}
+export const App = () => {
+  const { provider, userName } = useHocuspocusProvider();
+  const { flowToScreenPosition, screenToFlowPosition } = useReactFlow();
+
+  const ydoc = provider?.document ?? null;
+
+  const currentUser = useMemo<UserId>(() => {
+    return resolveCurrentUser(userName);
+  }, [userName]);
+
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [edges, setEdges] = useState<Edge[]>([]);
+  const [awareness, setAwareness] = useState<AwarenessUserData[]>([]);
+  const [eventLog, setEventLog] = useState<EventLogItem[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
+  const [graphNodesSnapshot, setGraphNodesSnapshot] = useState<
+    GraphNodeEntity[]
+  >([]);
+  const [graphLinksSnapshot, setGraphLinksSnapshot] = useState<
+    GraphLinkEntity[]
+  >([]);
+  const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
+  const [performance, setPerformance] = useState<PerformanceReadModel | null>(
+    null,
+  );
+  const [reviewCount, setReviewCount] = useState(0);
+
+  const [reviewSessions, setReviewSessions] = useState<ReviewSession[]>([]);
+  const [allEvaluations, setAllEvaluations] = useState<UserSessionEvaluation[]>(
+    [],
+  );
+  const [allTrustProfiles, setAllTrustProfiles] = useState<UserTrustProfile[]>(
+    [],
+  );
+  const [allLedgerEntries, setAllLedgerEntries] = useState<ScoreLedgerEntry[]>(
+    [],
+  );
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
+    null,
+  );
+
+  const lastLayoutSyncRef = useRef<Record<string, number>>({});
+
+  const pushLog = useCallback((message: string) => {
+    setEventLog((current) =>
+      [
+        {
+          ts: new Date().toLocaleTimeString(),
+          message,
+        },
+        ...current,
+      ].slice(0, 40),
+    );
+  }, []);
+
+  const pushCommandResult = useCallback(
+    (label: string, result: ExecuteCommandResult) => {
+      pushLog(`${label} :: ${result.decision.reason}`);
+
+      if (result.decision.warnings.length > 0) {
+        for (const warning of result.decision.warnings) {
+          pushLog(`warning :: ${warning}`);
+        }
+      }
+
+      if (result.reviewSession) {
+        pushLog(
+          `review closed :: ${result.reviewSession.label} (${result.reviewSession.sessionId})`,
+        );
+      }
+
+      if (result.performanceReadModel) {
+        setPerformance(result.performanceReadModel);
+      }
+    },
+    [pushLog],
+  );
+
+  useEffect(() => {
+    if (!ydoc) return;
+
+    const graphDoc = getGraphYDoc(ydoc);
+
+    const syncFromGraphDoc = () => {
+      seedGraphIfEmpty(ydoc);
+
+      const graphState = readGraphState(graphDoc);
+      const layouts = new Map<string, GraphNodeLayout>();
+
+      graphDoc.layoutMap.forEach((layout) => {
+        layouts.set(layout.nodeId, layout);
+      });
+
+      setGraphNodesSnapshot(graphState.nodes);
+      setGraphLinksSnapshot(graphState.links);
+
+      setNodes(
+        mapGraphNodesToReactFlowNodes(
+          graphState.nodes,
+          layouts,
+          ydoc,
+          currentUser,
+          pushLog,
+          graphState.links,
+        ),
+      );
+
+      setEdges(
+        mapGraphLinksToReactFlowEdges(
+          graphState.links,
+          ydoc,
+          currentUser,
+          pushLog,
+          graphState.nodes,
+        ),
+      );
+
+      const nextReviewSessions =
+        graphDoc.reviewSessionsArray.toArray() as ReviewSession[];
+      const nextEvaluations =
+        graphDoc.evaluationsArray.toArray() as UserSessionEvaluation[];
+      const nextTrustProfiles =
+        graphDoc.trustProfilesArray.toArray() as UserTrustProfile[];
+      const nextLedgerEntries =
+        graphDoc.ledgerArray.toArray() as ScoreLedgerEntry[];
+
+      setReviewSessions(nextReviewSessions);
+      setAllEvaluations(nextEvaluations);
+      setAllTrustProfiles(nextTrustProfiles);
+      setAllLedgerEntries(nextLedgerEntries);
+      setReviewCount(nextReviewSessions.length);
+
+      if (!selectedSessionId && nextReviewSessions.length > 0) {
+        setSelectedSessionId(
+          nextReviewSessions[nextReviewSessions.length - 1].sessionId,
+        );
+      }
+
+      if (
+        nextReviewSessions.length === 0 &&
+        nextEvaluations.length === 0 &&
+        nextTrustProfiles.length === 0 &&
+        nextLedgerEntries.length === 0
+      ) {
+        setPerformance(emptyPerformance(graphState.graphId));
+      } else {
+        setPerformance(
+          buildPerformanceReadModel({
+            graphId: graphState.graphId,
+            currentSessionId: nextReviewSessions.at(-1)?.sessionId,
+            evaluations: nextEvaluations,
+            trustProfiles: nextTrustProfiles,
+            ledgerEntries: nextLedgerEntries,
+            reviewSessions: nextReviewSessions,
+          }),
+        );
+      }
+    };
+
+    syncFromGraphDoc();
+
+    const observer = () => {
+      syncFromGraphDoc();
+    };
+
+    graphDoc.nodesMap.observe(observer);
+    graphDoc.linksMap.observe(observer);
+    graphDoc.layoutMap.observe(observer);
+    graphDoc.reviewSessionsArray.observe(observer);
+    graphDoc.ledgerArray.observe(observer);
+    graphDoc.evaluationsArray.observe(observer);
+    graphDoc.trustProfilesArray.observe(observer);
 
     return () => {
-      // unobserve when component unmounts to prevent memory leaks or duplicate event handling
-      nodesMap.unobserve(nodesObserver);
-      edgesMap.unobserve(edgesObserver);
+      graphDoc.nodesMap.unobserve(observer);
+      graphDoc.linksMap.unobserve(observer);
+      graphDoc.layoutMap.unobserve(observer);
+      graphDoc.reviewSessionsArray.unobserve(observer);
+      graphDoc.ledgerArray.unobserve(observer);
+      graphDoc.evaluationsArray.unobserve(observer);
+      graphDoc.trustProfilesArray.unobserve(observer);
     };
-  }, [nodesMap, edgesMap]);
+  }, [ydoc, currentUser, pushLog, selectedSessionId]);
 
-  const addNode = () => {
-    if (!nodesMap) return;
-    const nodeData = getNewNodeData();
-    nodesMap.set(nodeData.id, nodeData);
-  };
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setNodes((currentNodes) => applyNodeChanges(changes, currentNodes));
+  }, []);
 
-  //share outgoing changes
-  const onNodesChange = useCallback(
-    (changes: NodeChange<Node>[]) => {
-      if (!nodesMap) return;
+  const onNodeDrag = useCallback(
+    (_event: MouseEvent | globalThis.MouseEvent, node: Node) => {
+      if (!ydoc) return;
 
-      // current shared state read
-      const nodes = Array.from(nodesMap.values());
-      // apply changes to get the next state
-      const nextNodes = applyNodeChanges(changes, nodes);
+      const now = Date.now();
+      const lastSync = lastLayoutSyncRef.current[node.id] ?? 0;
 
-      for (const change of changes) {
-        if (change.type === "add" || change.type === "replace") {
-          // add or replace items for new or updated nodes
-          nodesMap.set(change.item.id, change.item);
-        } else if (change.type === "remove" && nodesMap.has(change.id)) {
-          // or remove them if a node was deleted
-          nodesMap.delete(change.id);
-        } else {
-          nodesMap.set(change.id, nextNodes.find((n) => n.id === change.id)!);
-        }
-      }
+      if (now - lastSync < 40) return;
+
+      lastLayoutSyncRef.current[node.id] = now;
+
+      const graphDoc = getGraphYDoc(ydoc);
+
+      graphDoc.layoutMap.set(node.id, {
+        nodeId: node.id,
+        x: node.position.x,
+        y: node.position.y,
+      });
     },
-    [nodesMap],
+    [ydoc],
   );
 
-  const onEdgesChange = useCallback(
-    (changes: EdgeChange<Edge>[]) => {
-      if (!edgesMap) return;
-      const edges = Array.from(edgesMap.values());
-      const nextEdges = applyEdgeChanges(changes, edges);
+  const onNodeDragStop = useCallback(
+    (_event: MouseEvent | globalThis.MouseEvent, node: Node) => {
+      if (!ydoc) return;
 
-      for (const change of changes) {
-        if (change.type === "add" || change.type === "replace") {
-          edgesMap.set(change.item.id, change.item);
-        } else if (change.type === "remove" && edgesMap.has(change.id)) {
-          edgesMap.delete(change.id);
-        } else {
-          edgesMap.set(change.id, nextEdges.find((n) => n.id === change.id)!);
-        }
-      }
+      const graphDoc = getGraphYDoc(ydoc);
+
+      graphDoc.layoutMap.set(node.id, {
+        nodeId: node.id,
+        x: node.position.x,
+        y: node.position.y,
+      });
     },
-    [edgesMap],
+    [ydoc],
   );
 
-  // trigger for reactflow whenever the user creates a new connection between nodes
+  const onNodeClick = useCallback<NodeMouseHandler<Node>>((_event, node) => {
+    setSelectedNodeId(node.id);
+    setSelectedLinkId(null);
+  }, []);
+
+  const onEdgeClick = useCallback<EdgeMouseHandler<Edge>>((_event, edge) => {
+    setSelectedNodeId(null);
+    setSelectedLinkId(edge.id);
+  }, []);
+
   const onConnect = useCallback(
-    (params: Connection) => {
-      if (!edgesMap) return;
-      
-      const edges = Array.from(edgesMap.values());
-      // generate a new edge and store it the shared state
-      const nextEdges = addEdge(params, edges);
+    (connection: Connection) => {
+      if (!ydoc || !connection.source || !connection.target) return;
 
-      //store it in the shared state if its not already there
-      for (const edge of nextEdges) {
-        if (edgesMap.has(edge.id)) {
-          continue;
-        }
+      const result = runGraphAction(ydoc, {
+        type: "ADD_LINK",
+        userId: currentUser,
+        sourceId: connection.source,
+        targetId: connection.target,
+      });
 
-        edgesMap.set(edge.id, edge);
-      }
+      pushCommandResult(
+        `[${currentUser}] ADD_LINK ${connection.source} -> ${connection.target}`,
+        result,
+      );
     },
-    [edgesMap],
+    [ydoc, currentUser, pushCommandResult],
   );
 
-  // Send awareness updates to other users
-  // this function is attached to on mouse move and on mouse drag
+  const closeReviewSession = useCallback(() => {
+    if (!ydoc) return;
+
+    const result = runGraphAction(ydoc, {
+      type: "CLOSE_REVIEW_SESSION",
+      userId: currentUser,
+      sessionLabel: `Performance review ${reviewCount + 1}`,
+    });
+
+    pushCommandResult(`[${currentUser}] CLOSE_REVIEW_SESSION`, result);
+  }, [ydoc, currentUser, reviewCount, pushCommandResult]);
+
+  const resetCurrentOwnerReviews = useCallback(() => {
+    if (!ydoc) return;
+
+    const result = runGraphAction(ydoc, {
+      type: "RESET_CURRENT_SESSION_OWNER_REVIEWS",
+      userId: currentUser,
+    });
+
+    pushCommandResult(
+      `[${currentUser}] RESET_CURRENT_SESSION_OWNER_REVIEWS`,
+      result,
+    );
+  }, [ydoc, currentUser, pushCommandResult]);
+
+  const resetReviewSessions = useCallback(() => {
+    if (!ydoc) return;
+
+    const result = runGraphAction(ydoc, {
+      type: "RESET_REVIEW_HISTORY",
+      userId: currentUser,
+    });
+
+    pushCommandResult(`[${currentUser}] RESET_REVIEW_HISTORY`, result);
+  }, [ydoc, currentUser, pushCommandResult]);
+
+  const resetAllOwnerReviews = useCallback(() => {
+    if (!ydoc) return;
+
+    const result = runGraphAction(ydoc, {
+      type: "RESET_ALL_OWNER_REVIEWS",
+      userId: currentUser,
+    });
+
+    pushCommandResult(`[${currentUser}] RESET_ALL_OWNER_REVIEWS`, result);
+  }, [ydoc, currentUser, pushCommandResult]);
+
   const updateAwareness = useCallback(
-    //takes the mouse event and call provider.setAwarenessField
-    (e: MouseEvent) => {
-      if (!provider) {
-        return;
-      }
+    (event: MouseEvent | globalThis.MouseEvent) => {
+      const awareness = provider?.awareness;
 
-      // Converting screen coordinates to flow position
+      if (!awareness) return;
 
-      // THE COORD TRAP
-      // because users can zoom and pan we cannot sed raw screen pixels;
-      // if we did that my cursor would be in the wrong place for someone who panned their view
-      // (1)therefore we need a helper to translate my screen pixels into the abosulte coord of the diagram
-      const flowPosition = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      const cursorPosition = screenToFlowPosition({
+        x: event.clientX,
+        y: event.clientY,
+      });
 
-      // pass users metadata
-      provider.setAwarenessField("userMetadata", {
+      awareness.setLocalStateField("userMetadata", {
         userName,
-        cursorPosition: flowPosition,
+        cursorPosition,
       });
     },
     [provider, screenToFlowPosition, userName],
   );
 
-  // Receiving awareness updates
-  // to see other users we use useeffect that subscribes  to the update event on the awareness object
   useEffect(() => {
-    if (!provider?.awareness) return;
+    const awareness = provider?.awareness;
+
+    if (!awareness) return;
 
     const awarenessObserver = () => {
-      //inside this listener we get a list of all states
-      const states = provider.awareness?.getStates();
-
-      if (!states) return;
-
+      const states = awareness.getStates();
       const updatedAwareness: AwarenessUserData[] = [];
 
-      //we iterate through them but we must filter out our own client ID otherwise we would see a ghost cursor following ours with network delay
       for (const [clientId, state] of states.entries()) {
-        const userMetadata: AwarenessUserData | undefined = state.userMetadata;
+        const userMetadata = state.userMetadata as
+          | AwarenessUserData
+          | undefined;
 
-        // Do not track this client's cursor
-        if (clientId === provider.awareness?.clientID || !userMetadata)
-          continue;
+        if (clientId === awareness.clientID || !userMetadata) continue;
 
-        // the remaining states are mapped to our local React state...
         updatedAwareness.push({
           userName: userMetadata.userName,
-          // Converting flow position to screen coordinates
-
-          //(2) when recieving someone elses position ; this takes their absolute coords and projects them onto my current screen viewport
           cursorPosition: flowToScreenPosition(userMetadata.cursorPosition),
         });
       }
-      //...which we the render as cursors components
+
       setAwareness(updatedAwareness);
     };
 
-    provider.awareness.on("update", awarenessObserver);
+    awareness.on("update", awarenessObserver);
 
     return () => {
-      provider.awareness?.off("update", awarenessObserver);
+      awareness.off("update", awarenessObserver);
     };
   }, [provider, flowToScreenPosition]);
 
-  return (
-    <>
-      <div className="diagram-container">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          fitView
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onMouseMove={updateAwareness}
-          onNodeDrag={updateAwareness}
-        >
-          <Background />
-          <Controls />
-          <MiniMap />
-        </ReactFlow>
+  const selectedNode =
+    graphNodesSnapshot.find((node) => node.id === selectedNodeId) ?? null;
 
-        <button className="add-node-btn" onClick={addNode}>
-          Add node
-        </button>
+  const selectedLink =
+    graphLinksSnapshot.find((link) => link.id === selectedLinkId) ?? null;
+
+  return (
+    <div className="app-shell">
+      <div className="app-main-grid">
+        <section className="flow-pane">
+          <div className="flow-surface">
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              onNodesChange={onNodesChange}
+              onNodeClick={onNodeClick}
+              onEdgeClick={onEdgeClick}
+              onNodeDrag={(event, node) => {
+                updateAwareness(event);
+                onNodeDrag(event, node);
+              }}
+              onNodeDragStop={onNodeDragStop}
+              onConnect={onConnect}
+              onMouseMove={updateAwareness}
+              fitView
+            >
+              <Background />
+              <Controls />
+            </ReactFlow>
+          </div>
+        </section>
+
+        <aside className="right-sidebar">
+          <div className="sidebar-section sidebar-controls">
+            <SessionReviewToolbar
+              currentUser={currentUser}
+              onCloseReviewSession={closeReviewSession}
+              onResetCurrentOwnerReviews={resetCurrentOwnerReviews}
+              onResetReviewSessions={resetReviewSessions}
+              onResetAllOwnerReviews={resetAllOwnerReviews}
+              currentSessionId={performance?.currentSessionId}
+              reviewsCount={reviewCount}
+              disabled={!ydoc}
+            />
+          </div>
+
+          <div className="sidebar-section sidebar-performance">
+            <PerformanceStatsPanel
+              performance={performance}
+              expandedUserId={expandedUserId}
+              onToggleExpand={(userId) =>
+                setExpandedUserId((current) =>
+                  current === userId ? null : userId,
+                )
+              }
+              embedded
+            />
+          </div>
+
+          <div className="sidebar-section sidebar-reviews">
+            <ReviewSessionsPanel
+              reviewSessions={reviewSessions}
+              evaluations={allEvaluations}
+              trustProfiles={allTrustProfiles}
+              ledgerEntries={allLedgerEntries}
+              selectedSessionId={selectedSessionId}
+              onSelectSession={setSelectedSessionId}
+              embedded
+            />
+          </div>
+        </aside>
       </div>
+
       {awareness.map(({ cursorPosition, userName }, index) => (
         <Cursor
-          key={index}
+          key={`${userName}-${index}`}
           cursorPosition={cursorPosition}
           userName={userName}
         />
       ))}
-    </>
+
+      <InspectorPanel
+        selectedNode={selectedNode}
+        selectedLink={selectedLink}
+        currentUser={currentUser}
+      />
+
+      <div className="event-log-panel">
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Event log</div>
+
+        {eventLog.length === 0 ? (
+          <div style={{ color: "#6b7280" }}>No events yet</div>
+        ) : (
+          eventLog.map((item, index) => (
+            <div
+              key={`${item.ts}-${index}`}
+              style={{
+                padding: "6px 0",
+                borderBottom: "1px solid #f3f4f6",
+              }}
+            >
+              <div style={{ color: "#6b7280", fontSize: 11 }}>{item.ts}</div>
+              <div>{item.message}</div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
   );
 };
-
-//====== Awareness ======//
-// the mechanism for sharing ephemeral state like user presence, cursor position, or selection across clients
-// ... data that doesn't need to be saved in the document history
-// one of the uses is real-time user cursors.
